@@ -249,6 +249,9 @@ DECLSPEC_IMPORT BOOL BeaconAddValue(const char * key, void * ptr);
 DECLSPEC_IMPORT void * BeaconGetValue(const char * key);
 DECLSPEC_IMPORT BOOL BeaconRemoveValue(const char * key);
 
+/* Adaptix: Register a job with JobsController for automatic output polling */
+DECLSPEC_IMPORT BOOL BeaconJobRegister(ULONG taskId, HANDLE hProcess, WORD pid, HANDLE hPipeRead, HANDLE hPipeWrite);
+
 /* Beacon Data Store functions
  *    These functions are used to access items in Beacon's Data Store.
  *    BeaconDataStoreGetItem returns NULL if the index does not exist.
