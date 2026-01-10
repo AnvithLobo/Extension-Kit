@@ -31,8 +31,6 @@ cmd_execute_donut.addArgString("path", true, "Path to local EXE/DLL (Required fo
 cmd_execute_donut.addArgString("params", false, "Arguments for the executable");
 
 cmd_execute_donut.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
-    // Parsing is now handled by the framework into parsed_json
-    // Flags are mapped by their 'name' (2nd arg in addArgFlag*)
 
     var ppid = 0;
     if (parsed_json["ppid"]) ppid = parsed_json["ppid"];
@@ -82,12 +80,6 @@ cmd_execute_donut.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines
     // Validate PPID
     if (isNaN(ppid)) {
         ax.console_message(id, "Error", "error", "Invalid PPID provided");
-        return;
-    }
-
-    // Validate Architecture for Pipe Mode
-    if (ppid > 0 && arch != "x64" && arch != "x86") {
-        ax.console_message(id, "Error", "error", "Architecture must be x64 or x86 when using PPID spoofing");
         return;
     }
 

