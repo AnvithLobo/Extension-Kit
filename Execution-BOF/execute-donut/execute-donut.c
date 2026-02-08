@@ -56,6 +56,11 @@ int _strlen(const char* s) {
 // --- Imports ---
 WINBASEAPI HMODULE WINAPI KERNEL32$GetModuleHandleA(LPCSTR);
 WINBASEAPI FARPROC WINAPI KERNEL32$GetProcAddress(HMODULE, LPCSTR);
+typedef BOOL (WINAPI *EXP_OpenProcessToken)(HANDLE, DWORD, PHANDLE);
+typedef BOOL (WINAPI *EXP_DuplicateTokenEx)(HANDLE, DWORD, LPSECURITY_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL, TOKEN_TYPE, PHANDLE);
+typedef BOOL (WINAPI *EXP_CreateProcessAsUserA)(HANDLE, LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
+typedef BOOL (WINAPI *EXP_InitializeSecurityDescriptor)(PSECURITY_DESCRIPTOR, DWORD);
+typedef BOOL (WINAPI *EXP_SetSecurityDescriptorDacl)(PSECURITY_DESCRIPTOR, BOOL, PACL, BOOL);
 WINBASEAPI DWORD WINAPI KERNEL32$GetLastError(VOID);
 WINBASEAPI BOOL WINAPI KERNEL32$CloseHandle(HANDLE);
 WINBASEAPI BOOL WINAPI KERNEL32$CreateProcessA(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
@@ -476,8 +481,56 @@ void go(char* args, int len) {
         si_ptr = &si_plain;
     }
 
-    // CreateProcess - bInheritHandles is FALSE when using pipe client mode
-    BOOL processSuccess = KERNEL32$CreateProcessA(NULL, program, NULL, NULL, !usePipeClient, creationFlags, NULL, NULL, si_ptr, &pi);
+    // CreateProcess Logic
+    // We want to use CreateProcessAsUserA with a duplicated, permissive (NULL DACL) token 
+    // to ensure the child process has full rights to manage its own token (avoiding Access Denied on AdjustTokenPrivileges).
+
+    HANDLE hDupToken = NULL;
+    HMODULE hAdvapi32 = KERNEL32$LoadLibraryA("advapi32.dll");
+    
+    // Resolve APIs
+    if (hAdvapi32) {
+         EXP_OpenProcessToken pOpenProcessToken = (EXP_OpenProcessToken)KERNEL32$GetProcAddress(hAdvapi32, "OpenProcessToken");
+         EXP_DuplicateTokenEx pDuplicateTokenEx = (EXP_DuplicateTokenEx)KERNEL32$GetProcAddress(hAdvapi32, "DuplicateTokenEx");
+         EXP_InitializeSecurityDescriptor pInitializeSecurityDescriptor = (EXP_InitializeSecurityDescriptor)KERNEL32$GetProcAddress(hAdvapi32, "InitializeSecurityDescriptor");
+         EXP_SetSecurityDescriptorDacl pSetSecurityDescriptorDacl = (EXP_SetSecurityDescriptorDacl)KERNEL32$GetProcAddress(hAdvapi32, "SetSecurityDescriptorDacl");
+         
+         if (pOpenProcessToken && pDuplicateTokenEx && pInitializeSecurityDescriptor && pSetSecurityDescriptorDacl) {
+             HANDLE hCurrentToken = NULL;
+             // Use pseudo-handle for current process
+             if (pOpenProcessToken((HANDLE)-1, TOKEN_ALL_ACCESS, &hCurrentToken)) {
+                 
+                 // Create a permissive security descriptor (NULL DACL)
+                 SECURITY_DESCRIPTOR sd;
+                 pInitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+                 pSetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
+                 
+                 SECURITY_ATTRIBUTES saToken;
+                 saToken.nLength = sizeof(SECURITY_ATTRIBUTES);
+                 saToken.lpSecurityDescriptor = &sd;
+                 saToken.bInheritHandle = TRUE; // Token handle itself is inheritable? Doesn't matter much for CreateProcessAsUser
+
+                 pDuplicateTokenEx(hCurrentToken, TOKEN_ALL_ACCESS, &saToken, SecurityImpersonation, TokenPrimary, &hDupToken);
+                 KERNEL32$CloseHandle(hCurrentToken);
+             }
+         }
+    }
+
+    BOOL processSuccess = FALSE;
+    BOOL bInheritHandles = !usePipeClient; // TRUE for standard, FALSE for pipe client (PPID)
+
+    if (hDupToken && hAdvapi32) {
+        EXP_CreateProcessAsUserA pCreateProcessAsUserA = (EXP_CreateProcessAsUserA)KERNEL32$GetProcAddress(hAdvapi32, "CreateProcessAsUserA");
+        if (pCreateProcessAsUserA) {
+             processSuccess = pCreateProcessAsUserA(hDupToken, NULL, program, NULL, NULL, bInheritHandles, creationFlags, NULL, NULL, si_ptr, &pi);
+        } else {
+             // Fallback
+             processSuccess = KERNEL32$CreateProcessA(NULL, program, NULL, NULL, bInheritHandles, creationFlags, NULL, NULL, si_ptr, &pi);
+        }
+        KERNEL32$CloseHandle(hDupToken);
+    } else {
+        processSuccess = KERNEL32$CreateProcessA(NULL, program, NULL, NULL, bInheritHandles, creationFlags, NULL, NULL, si_ptr, &pi);
+    }
     
     // Cleanup handles we don't need after CreateProcess
     if(!usePipeClient) {
